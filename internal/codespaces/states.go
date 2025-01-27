@@ -5,21 +5,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"net"
-	"strings"
+	"io"
 	"time"
 
 	"github.com/cli/cli/v2/internal/codespaces/api"
-	"github.com/cli/cli/v2/pkg/liveshare"
+	"github.com/cli/cli/v2/internal/codespaces/portforwarder"
+	"github.com/cli/cli/v2/internal/codespaces/rpc"
+	"github.com/cli/cli/v2/internal/text"
 )
 
 // PostCreateStateStatus is a string value representing the different statuses a state can have.
 type PostCreateStateStatus string
 
 func (p PostCreateStateStatus) String() string {
-	return strings.Title(string(p))
+	return text.Title(string(p))
 }
 
 const (
@@ -38,42 +37,51 @@ type PostCreateState struct {
 // PollPostCreateStates watches for state changes in a codespace,
 // and calls the supplied poller for each batch of state changes.
 // It runs until it encounters an error, including cancellation of the context.
-func PollPostCreateStates(ctx context.Context, logger logger, apiClient apiClient, codespace *api.Codespace, poller func([]PostCreateState)) (err error) {
-	noopLogger := log.New(ioutil.Discard, "", 0)
-
-	session, err := ConnectToLiveshare(ctx, logger, noopLogger, apiClient, codespace)
+func PollPostCreateStates(ctx context.Context, progress progressIndicator, apiClient apiClient, codespace *api.Codespace, poller func([]PostCreateState)) (err error) {
+	codespaceConnection, err := GetCodespaceConnection(ctx, progress, apiClient, codespace)
 	if err != nil {
-		return fmt.Errorf("connect to Live Share: %w", err)
+		return fmt.Errorf("error connecting to codespace: %w", err)
 	}
-	defer func() {
-		if closeErr := session.Close(); err == nil {
-			err = closeErr
-		}
-	}()
+
+	fwd, err := portforwarder.NewPortForwarder(ctx, codespaceConnection)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+	defer safeClose(fwd, &err)
 
 	// Ensure local port is listening before client (getPostCreateOutput) connects.
-	listen, err := net.Listen("tcp", "127.0.0.1:0") // arbitrary port
+	listen, localPort, err := ListenTCP(0, false)
 	if err != nil {
 		return err
 	}
-	localPort := listen.Addr().(*net.TCPAddr).Port
 
-	logger.Println("Fetching SSH Details...")
-	remoteSSHServerPort, sshUser, err := session.StartSSHServer(ctx)
+	progress.StartProgressIndicatorWithLabel("Fetching SSH Details")
+	invoker, err := rpc.CreateInvoker(ctx, fwd)
+	if err != nil {
+		return err
+	}
+	defer safeClose(invoker, &err)
+
+	remoteSSHServerPort, sshUser, err := invoker.StartSSHServer(ctx)
 	if err != nil {
 		return fmt.Errorf("error getting ssh server details: %w", err)
 	}
+	progress.StopProgressIndicator()
 
+	progress.StartProgressIndicatorWithLabel("Fetching status")
 	tunnelClosed := make(chan error, 1) // buffered to avoid sender stuckness
 	go func() {
-		fwd := liveshare.NewPortForwarder(session, "sshd", remoteSSHServerPort, false)
-		tunnelClosed <- fwd.ForwardToListener(ctx, listen) // error is non-nil
+		opts := portforwarder.ForwardPortOpts{
+			Port:     remoteSSHServerPort,
+			Internal: true,
+		}
+		tunnelClosed <- fwd.ForwardPortToListener(ctx, opts, listen)
 	}()
 
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 
-	for {
+	for ticks := 0; ; ticks++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -83,6 +91,13 @@ func PollPostCreateStates(ctx context.Context, logger logger, apiClient apiClien
 
 		case <-t.C:
 			states, err := getPostCreateOutput(ctx, localPort, sshUser)
+			// There is an active progress indicator before the first tick
+			// to show that we are fetching statuses.
+			// Once the first tick happens, we stop the indicator and let
+			// the subsequent post create states manage their own progress.
+			if ticks == 0 {
+				progress.StopProgressIndicator()
+			}
 			if err != nil {
 				return fmt.Errorf("get post create output: %w", err)
 			}
@@ -114,4 +129,10 @@ func getPostCreateOutput(ctx context.Context, tunnelPort int, user string) ([]Po
 	}
 
 	return output.Steps, nil
+}
+
+func safeClose(closer io.Closer, err *error) {
+	if closeErr := closer.Close(); *err == nil {
+		*err = closeErr
+	}
 }

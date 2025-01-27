@@ -6,15 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cli/cli/v2/internal/codespaces"
 	"github.com/cli/cli/v2/internal/codespaces/api"
-	"github.com/cli/cli/v2/pkg/cmd/codespace/output"
-	"github.com/cli/cli/v2/pkg/liveshare"
+	"github.com/cli/cli/v2/internal/codespaces/portforwarder"
+	"github.com/cli/cli/v2/internal/tableprinter"
+	"github.com/cli/cli/v2/pkg/cmdutil"
+	"github.com/microsoft/dev-tunnels/go/tunnels"
 	"github.com/muhammadmuzzammil1998/jsonc"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -24,8 +25,8 @@ import (
 // according to the specified flags.
 func newPortsCmd(app *App) *cobra.Command {
 	var (
-		codespace string
-		asJSON    bool
+		selector *CodespaceSelector
+		exporter cmdutil.Exporter
 	)
 
 	portsCmd := &cobra.Command{
@@ -33,40 +34,45 @@ func newPortsCmd(app *App) *cobra.Command {
 		Short: "List ports in a codespace",
 		Args:  noArgsConstraint,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return app.ListPorts(cmd.Context(), codespace, asJSON)
+			return app.ListPorts(cmd.Context(), selector, exporter)
 		},
 	}
 
-	portsCmd.PersistentFlags().StringVarP(&codespace, "codespace", "c", "", "Name of the codespace")
-	portsCmd.Flags().BoolVar(&asJSON, "json", false, "Output as JSON")
+	selector = AddCodespaceSelector(portsCmd, app.apiClient)
 
-	portsCmd.AddCommand(newPortsForwardCmd(app))
-	portsCmd.AddCommand(newPortsPrivacyCmd(app))
+	cmdutil.AddJSONFlags(portsCmd, &exporter, portFields)
+
+	portsCmd.AddCommand(newPortsForwardCmd(app, selector))
+	portsCmd.AddCommand(newPortsVisibilityCmd(app, selector))
 
 	return portsCmd
 }
 
 // ListPorts lists known ports in a codespace.
-func (a *App) ListPorts(ctx context.Context, codespaceName string, asJSON bool) (err error) {
-	codespace, err := getOrChooseCodespace(ctx, a.apiClient, codespaceName)
+func (a *App) ListPorts(ctx context.Context, selector *CodespaceSelector, exporter cmdutil.Exporter) (err error) {
+	codespace, err := selector.Select(ctx)
 	if err != nil {
-		// TODO(josebalius): remove special handling of this error here and it other places
-		if err == errNoCodespaces {
-			return err
-		}
-		return fmt.Errorf("error choosing codespace: %w", err)
+		return err
 	}
 
 	devContainerCh := getDevContainer(ctx, a.apiClient, codespace)
 
-	session, err := codespaces.ConnectToLiveshare(ctx, a.logger, noopLogger(), a.apiClient, codespace)
+	codespaceConnection, err := codespaces.GetCodespaceConnection(ctx, a, a.apiClient, codespace)
 	if err != nil {
-		return fmt.Errorf("error connecting to Live Share: %w", err)
+		return fmt.Errorf("error connecting to codespace: %w", err)
 	}
-	defer safeClose(session, &err)
 
-	a.logger.Println("Loading ports...")
-	ports, err := session.GetSharedServers(ctx)
+	fwd, err := portforwarder.NewPortForwarder(ctx, codespaceConnection)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+	defer safeClose(fwd, &err)
+
+	var ports []*tunnels.TunnelPort
+	err = a.RunWithProgress("Fetching ports", func() (err error) {
+		ports, err = fwd.ListPorts(ctx)
+		return
+	})
 	if err != nil {
 		return fmt.Errorf("error getting ports of shared servers: %w", err)
 	}
@@ -74,30 +80,95 @@ func (a *App) ListPorts(ctx context.Context, codespaceName string, asJSON bool) 
 	devContainerResult := <-devContainerCh
 	if devContainerResult.err != nil {
 		// Warn about failure to read the devcontainer file. Not a codespace command error.
-		_, _ = a.logger.Errorf("Failed to get port names: %v\n", devContainerResult.err.Error())
+		a.errLogger.Printf("Failed to get port names: %v", devContainerResult.err.Error())
 	}
 
-	table := output.NewTable(os.Stdout, asJSON)
-	table.SetHeader([]string{"Label", "Port", "Privacy", "Browse URL"})
-	for _, port := range ports {
-		sourcePort := strconv.Itoa(port.SourcePort)
-		var portName string
-		if devContainerResult.devContainer != nil {
-			if attributes, ok := devContainerResult.devContainer.PortAttributes[sourcePort]; ok {
-				portName = attributes.Label
-			}
+	var portInfos []*portInfo
+
+	for _, p := range ports {
+		// filter out internal ports from list
+		if portforwarder.IsInternalPort(p) {
+			continue
 		}
 
-		table.Append([]string{
-			portName,
-			sourcePort,
-			port.Privacy,
-			fmt.Sprintf("https://%s-%s.githubpreview.dev/", codespace.Name, sourcePort),
+		portInfos = append(portInfos, &portInfo{
+			Port:         p,
+			codespace:    codespace,
+			devContainer: devContainerResult.devContainer,
 		})
 	}
-	table.Render()
 
-	return nil
+	if err := a.io.StartPager(); err != nil {
+		a.errLogger.Printf("error starting pager: %v", err)
+	}
+	defer a.io.StopPager()
+
+	if exporter != nil {
+		return exporter.Write(a.io, portInfos)
+	}
+
+	cs := a.io.ColorScheme()
+	tp := tableprinter.New(a.io, tableprinter.WithHeader("LABEL", "PORT", "VISIBILITY", "BROWSE URL"))
+
+	for _, port := range portInfos {
+		// Convert the ACE to a friendly visibility string (private, org, public)
+		visibility := portforwarder.AccessControlEntriesToVisibility(port.Port.AccessControl.Entries)
+
+		tp.AddField(port.Label())
+		tp.AddField(cs.Yellow(fmt.Sprintf("%d", port.Port.PortNumber)))
+		tp.AddField(visibility)
+		tp.AddField(port.BrowseURL())
+		tp.EndRow()
+	}
+	return tp.Render()
+}
+
+type portInfo struct {
+	Port         *tunnels.TunnelPort
+	codespace    *api.Codespace
+	devContainer *devContainer
+}
+
+func (pi *portInfo) BrowseURL() string {
+	return fmt.Sprintf("https://%s-%d.app.github.dev", pi.codespace.Name, pi.Port.PortNumber)
+}
+
+func (pi *portInfo) Label() string {
+	if pi.devContainer != nil {
+		portStr := strconv.Itoa(int(pi.Port.PortNumber))
+		if attributes, ok := pi.devContainer.PortAttributes[portStr]; ok {
+			return attributes.Label
+		}
+	}
+	return ""
+}
+
+var portFields = []string{
+	"sourcePort",
+	"visibility",
+	"label",
+	"browseUrl",
+}
+
+func (pi *portInfo) ExportData(fields []string) map[string]interface{} {
+	data := map[string]interface{}{}
+
+	for _, f := range fields {
+		switch f {
+		case "sourcePort":
+			data[f] = pi.Port.PortNumber
+		case "visibility":
+			data[f] = portforwarder.AccessControlEntriesToVisibility(pi.Port.AccessControl.Entries)
+		case "label":
+			data[f] = pi.Label()
+		case "browseUrl":
+			data[f] = pi.BrowseURL()
+		default:
+			panic("unknown field: " + f)
+		}
+	}
+
+	return data
 }
 
 type devContainerResult struct {
@@ -135,7 +206,7 @@ func getDevContainer(ctx context.Context, apiClient apiClient, codespace *api.Co
 
 		var container devContainer
 		if err := json.Unmarshal(convertedJSON, &container); err != nil {
-			ch <- devContainerResult{nil, fmt.Errorf("error unmarshaling: %w", err)}
+			ch <- devContainerResult{nil, fmt.Errorf("error unmarshalling: %w", err)}
 			return
 		}
 
@@ -144,120 +215,112 @@ func getDevContainer(ctx context.Context, apiClient apiClient, codespace *api.Co
 	return ch
 }
 
-func newPortsPrivacyCmd(app *App) *cobra.Command {
+func newPortsVisibilityCmd(app *App, selector *CodespaceSelector) *cobra.Command {
 	return &cobra.Command{
-		Use:     "privacy <port:public|private|org>...",
-		Short:   "Change the privacy of the forwarded port",
-		Example: "gh codespace ports privacy 80:org 3000:private 8000:public",
-		Args:    cobra.ArbitraryArgs,
+		Use:     "visibility <port>:{public|private|org}...",
+		Short:   "Change the visibility of the forwarded port",
+		Example: "gh codespace ports visibility 80:org 3000:private 8000:public",
+		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
-				return fmt.Errorf("at least one port privacy argument is required")
-			}
-			codespace, err := cmd.Flags().GetString("codespace")
-			if err != nil {
-				// should only happen if flag is not defined
-				// or if the flag is not of string type
-				// since it's a persistent flag that we control it should never happen
-				return fmt.Errorf("get codespace flag: %w", err)
-			}
-			return app.UpdatePortPrivacy(cmd.Context(), codespace, args)
+			return app.UpdatePortVisibility(cmd.Context(), selector, args)
 		},
 	}
 }
 
-func (a *App) UpdatePortPrivacy(ctx context.Context, codespaceName string, args []string) (err error) {
-	ports, err := a.parsePortPrivacies(args)
+func (a *App) UpdatePortVisibility(ctx context.Context, selector *CodespaceSelector, args []string) (err error) {
+	ports, err := a.parsePortVisibilities(args)
 	if err != nil {
 		return fmt.Errorf("error parsing port arguments: %w", err)
 	}
-	codespace, err := getOrChooseCodespace(ctx, a.apiClient, codespaceName)
+
+	codespace, err := selector.Select(ctx)
 	if err != nil {
-		if err == errNoCodespaces {
+		return err
+	}
+
+	codespaceConnection, err := codespaces.GetCodespaceConnection(ctx, a, a.apiClient, codespace)
+	if err != nil {
+		return fmt.Errorf("error connecting to codespace: %w", err)
+	}
+
+	fwd, err := portforwarder.NewPortForwarder(ctx, codespaceConnection)
+	if err != nil {
+		return fmt.Errorf("failed to create port forwarder: %w", err)
+	}
+	defer safeClose(fwd, &err)
+
+	// TODO: check if port visibility can be updated in parallel instead of sequentially
+	for _, port := range ports {
+		err := a.RunWithProgress(fmt.Sprintf("Updating port %d visibility to: %s", port.number, port.visibility), func() (err error) {
+			// wait for success or failure
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+
+			err = fwd.UpdatePortVisibility(ctx, port.number, port.visibility)
+			if err != nil {
+				return fmt.Errorf("error updating port %d to %s: %w", port.number, port.visibility, err)
+			}
+			return nil
+		})
+		if err != nil {
 			return err
 		}
-		return fmt.Errorf("error getting codespace: %w", err)
-	}
 
-	session, err := codespaces.ConnectToLiveshare(ctx, a.logger, noopLogger(), a.apiClient, codespace)
-	if err != nil {
-		return fmt.Errorf("error connecting to Live Share: %w", err)
-	}
-	defer safeClose(session, &err)
-
-	for _, port := range ports {
-		if err := session.UpdateSharedServerPrivacy(ctx, port.number, port.privacy); err != nil {
-			return fmt.Errorf("error update port to public: %w", err)
-		}
-
-		a.logger.Printf("Port %d is now %s scoped.\n", port.number, port.privacy)
 	}
 
 	return nil
 }
 
-type portPrivacy struct {
-	number  int
-	privacy string
+type portVisibility struct {
+	number     int
+	visibility string
 }
 
-func (a *App) parsePortPrivacies(args []string) ([]portPrivacy, error) {
-	ports := make([]portPrivacy, 0, len(args))
+func (a *App) parsePortVisibilities(args []string) ([]portVisibility, error) {
+	ports := make([]portVisibility, 0, len(args))
 	for _, a := range args {
 		fields := strings.Split(a, ":")
 		if len(fields) != 2 {
-			return nil, fmt.Errorf("invalid port privacy format for %q", a)
+			return nil, fmt.Errorf("invalid port visibility format for %q", a)
 		}
-		portStr, privacy := fields[0], fields[1]
+		portStr, visibility := fields[0], fields[1]
 		portNumber, err := strconv.Atoi(portStr)
 		if err != nil {
 			return nil, fmt.Errorf("invalid port number: %w", err)
 		}
-		ports = append(ports, portPrivacy{portNumber, privacy})
+		ports = append(ports, portVisibility{portNumber, visibility})
 	}
 	return ports, nil
 }
 
 // NewPortsForwardCmd returns a Cobra "ports forward" subcommand, which forwards a set of
 // port pairs from the codespace to localhost.
-func newPortsForwardCmd(app *App) *cobra.Command {
+func newPortsForwardCmd(app *App, selector *CodespaceSelector) *cobra.Command {
 	return &cobra.Command{
 		Use:   "forward <remote-port>:<local-port>...",
 		Short: "Forward ports",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			codespace, err := cmd.Flags().GetString("codespace")
-			if err != nil {
-				// should only happen if flag is not defined
-				// or if the flag is not of string type
-				// since it's a persistent flag that we control it should never happen
-				return fmt.Errorf("get codespace flag: %w", err)
-			}
-
-			return app.ForwardPorts(cmd.Context(), codespace, args)
+			return app.ForwardPorts(cmd.Context(), selector, args)
 		},
 	}
 }
 
-func (a *App) ForwardPorts(ctx context.Context, codespaceName string, ports []string) (err error) {
+func (a *App) ForwardPorts(ctx context.Context, selector *CodespaceSelector, ports []string) (err error) {
 	portPairs, err := getPortPairs(ports)
 	if err != nil {
 		return fmt.Errorf("get port pairs: %w", err)
 	}
 
-	codespace, err := getOrChooseCodespace(ctx, a.apiClient, codespaceName)
+	codespace, err := selector.Select(ctx)
 	if err != nil {
-		if err == errNoCodespaces {
-			return err
-		}
-		return fmt.Errorf("error getting codespace: %w", err)
+		return err
 	}
 
-	session, err := codespaces.ConnectToLiveshare(ctx, a.logger, noopLogger(), a.apiClient, codespace)
+	codespaceConnection, err := codespaces.GetCodespaceConnection(ctx, a, a.apiClient, codespace)
 	if err != nil {
-		return fmt.Errorf("error connecting to Live Share: %w", err)
+		return fmt.Errorf("error connecting to codespace: %w", err)
 	}
-	defer safeClose(session, &err)
 
 	// Run forwarding of all ports concurrently, aborting all of
 	// them at the first failure, including cancellation of the context.
@@ -265,15 +328,23 @@ func (a *App) ForwardPorts(ctx context.Context, codespaceName string, ports []st
 	for _, pair := range portPairs {
 		pair := pair
 		group.Go(func() error {
-			listen, err := net.Listen("tcp", fmt.Sprintf(":%d", pair.local))
+			listen, _, err := codespaces.ListenTCP(pair.local, true)
 			if err != nil {
 				return err
 			}
 			defer listen.Close()
-			a.logger.Printf("Forwarding ports: remote %d <=> local %d\n", pair.remote, pair.local)
-			name := fmt.Sprintf("share-%d", pair.remote)
-			fwd := liveshare.NewPortForwarder(session, name, pair.remote, false)
-			return fwd.ForwardToListener(ctx, listen) // error always non-nil
+
+			a.errLogger.Printf("Forwarding ports: remote %d <=> local %d", pair.remote, pair.local)
+			fwd, err := portforwarder.NewPortForwarder(ctx, codespaceConnection)
+			if err != nil {
+				return fmt.Errorf("failed to create port forwarder: %w", err)
+			}
+			defer safeClose(fwd, &err)
+
+			opts := portforwarder.ForwardPortOpts{
+				Port: pair.remote,
+			}
+			return fwd.ForwardPortToListener(ctx, opts, listen)
 		})
 	}
 	return group.Wait() // first error
